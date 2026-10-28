@@ -1046,38 +1046,43 @@ static int pearl_lk_win_cnt;
 static int pearl_lk_na = 2, pearl_lk_ns = 2;
 
 static int __init pearl_lkwin_scan(unsigned long node, const char *uname,
-				   int depth, void *data)
+				   void *data)
 {
-	const __be32 *reg, *prop;
-	int len, i;
-	u64 base = 0, size = 0;
+	const __be32 *reg;
+	int len, i, cells = pearl_lk_na + pearl_lk_ns;
+	u64 base, size;
 
-	if (depth == 1 &&
-	    (!strcmp(uname, "reserved-memory") ||
-	     !strcmp(uname, "/reserved-memory"))) {
-		prop = of_get_flat_dt_prop(node, "#address-cells", NULL);
-		pearl_lk_na = prop ? be32_to_cpup(prop) : 2;
-		prop = of_get_flat_dt_prop(node, "#size-cells", NULL);
-		pearl_lk_ns = prop ? be32_to_cpup(prop) : 2;
-		return 0;
-	}
-	if (depth != 2 || !strstr(uname, "reserved-memory/"))
-		return 0;
 	/* CMA / shared-dma-pool windows stay usable: the kernel recycles them. */
 	if (of_get_flat_dt_prop(node, "reusable", NULL))
 		return 0;
 	reg = of_get_flat_dt_prop(node, "reg", &len);
-	if (!reg || len < (pearl_lk_na + pearl_lk_ns) * 4)
+	if (!reg)
 		return 0;
-	for (i = 0; i < pearl_lk_na; i++)
-		base = (base << 32) | be32_to_cpup(reg++);
-	for (i = 0; i < pearl_lk_ns; i++)
-		size = (size << 32) | be32_to_cpup(reg++);
-	if (!size || pearl_lk_win_cnt >= PEARL_LKWIN_MAX)
+	if (len <= 0 || len % (cells * sizeof(*reg))) {
+		pr_warn("PEARL-LKRMEM: invalid reg length for %s: %d\n",
+			uname, len);
 		return 0;
-	pearl_lk_wins[pearl_lk_win_cnt].base = base;
-	pearl_lk_wins[pearl_lk_win_cnt].size = size;
-	pearl_lk_win_cnt++;
+	}
+	while (len) {
+		base = 0;
+		size = 0;
+		for (i = 0; i < pearl_lk_na; i++)
+			base = (base << 32) | be32_to_cpup(reg++);
+		for (i = 0; i < pearl_lk_ns; i++)
+			size = (size << 32) | be32_to_cpup(reg++);
+		len -= cells * sizeof(*reg);
+		if (!size)
+			continue;
+		if (base + size < base) {
+			pr_warn("PEARL-LKRMEM: overflowing range for %s\n", uname);
+			continue;
+		}
+		if (pearl_lk_win_cnt >= PEARL_LKWIN_MAX)
+			panic("PEARL-LKRMEM: too many LK reserved windows");
+		pearl_lk_wins[pearl_lk_win_cnt].base = base;
+		pearl_lk_wins[pearl_lk_win_cnt].size = size;
+		pearl_lk_win_cnt++;
+	}
 	return 0;
 }
 
@@ -1150,9 +1155,32 @@ static void __init pearl_early_ccif2_publish(void)
 
 static void __init pearl_reserve_lk_reserved_mem(void)
 {
-	int i;
+	const __be32 *prop;
+	int i, parent, len;
 
-	of_scan_flat_dt(pearl_lkwin_scan, NULL);
+	parent = fdt_path_offset(initial_boot_params, "/reserved-memory");
+	if (parent < 0) {
+		pr_warn("PEARL-LKRMEM: LK FDT has no reserved-memory node\n");
+		return;
+	}
+	prop = of_get_flat_dt_prop(parent, "#address-cells", &len);
+	if (prop && len == sizeof(*prop))
+		pearl_lk_na = be32_to_cpup(prop);
+	prop = of_get_flat_dt_prop(parent, "#size-cells", &len);
+	if (prop && len == sizeof(*prop))
+		pearl_lk_ns = be32_to_cpup(prop);
+	if (pearl_lk_na < 1 || pearl_lk_na > 2 ||
+	    pearl_lk_ns < 1 || pearl_lk_ns > 2) {
+		pr_warn("PEARL-LKRMEM: unsupported address/size cells %d/%d\n",
+			pearl_lk_na, pearl_lk_ns);
+		return;
+	}
+
+	/* The scan callback gets a node name, not a full path.  Restrict the
+	 * walk to direct children of /reserved-memory instead of searching
+	 * for "reserved-memory/" in that name (which always matched nothing).
+	 */
+	of_scan_flat_dt_subnodes(parent, pearl_lkwin_scan, NULL);
 	pr_info("PEARL-LKRMEM: LK reserved %d window(s), #a=%d #s=%d\n",
 		pearl_lk_win_cnt, pearl_lk_na, pearl_lk_ns);
 	for (i = 0; i < pearl_lk_win_cnt; i++) {
@@ -1160,8 +1188,8 @@ static void __init pearl_reserve_lk_reserved_mem(void)
 		phys_addr_t sz = pearl_lk_wins[i].size;
 		phys_addr_t e = b + sz;
 
-		memblock_reserve(b, sz);
-		memblock_mark_nomap(b, sz);
+		if (memblock_reserve(b, sz) || memblock_mark_nomap(b, sz))
+			panic("PEARL-LKRMEM: failed to reserve LK window %d", i);
 		pr_info("PEARL-LKRMEM: [%02d] %pa-%pa (%pa) reserved+nomap\n",
 			i, &b, &e, &sz);
 	}
@@ -1213,7 +1241,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			"mt6895-xiaomi-pearl.dtb (%d bytes)\n",
 			(int)(_binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_pearl_dtb_end -
 			      _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_pearl_dtb_start));
-		initial_boot_params = _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_pearl_dtb_start;
+		/* Refresh the FDT pointer, physical address and CRC together.
+		 * Only verify it here: re-scanning /chosen or /memory would replace
+		 * LK's actual boot arguments and RAM layout with the embedded ones.
+		 */
+		if (!early_init_dt_verify(
+			_binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_pearl_dtb_start,
+			__pa_symbol(_binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_pearl_dtb_start)))
+			panic("PEARL-DTB: invalid embedded pearl device tree");
 
 		/*
 		 * PEARL-LKINFO: LK injects "ccci,modem_info_v2" into the mddriver
