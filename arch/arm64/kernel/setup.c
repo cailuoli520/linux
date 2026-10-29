@@ -27,8 +27,11 @@
 #include <linux/panic_notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
+#include <linux/of.h>
 #include <linux/of_fdt.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/libfdt.h>
+#include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/efi.h>
 #include <linux/psci.h>
@@ -1044,6 +1047,8 @@ struct pearl_lkwin {
 static struct pearl_lkwin pearl_lk_wins[PEARL_LKWIN_MAX];
 static int pearl_lk_win_cnt;
 static int pearl_lk_na = 2, pearl_lk_ns = 2;
+static struct pearl_lkwin pearl_lk_wifi_pool __initdata;
+static int pearl_lk_wifi_pool_count __initdata;
 
 static int __init pearl_lkwin_scan(unsigned long node, const char *uname,
 				   void *data)
@@ -1051,6 +1056,12 @@ static int __init pearl_lkwin_scan(unsigned long node, const char *uname,
 	const __be32 *reg;
 	int len, i, cells = pearl_lk_na + pearl_lk_ns;
 	u64 base, size;
+	bool wifi_pool, single_range;
+
+	wifi_pool = strstr(uname, "wifi-reserve-memory") &&
+		of_flat_dt_is_compatible(node, "shared-dma-pool");
+	if (wifi_pool)
+		pearl_lk_wifi_pool_count++;
 
 	/* CMA / shared-dma-pool windows stay usable: the kernel recycles them. */
 	if (of_get_flat_dt_prop(node, "reusable", NULL))
@@ -1063,6 +1074,7 @@ static int __init pearl_lkwin_scan(unsigned long node, const char *uname,
 			uname, len);
 		return 0;
 	}
+	single_range = len == cells * sizeof(*reg);
 	while (len) {
 		base = 0;
 		size = 0;
@@ -1082,6 +1094,10 @@ static int __init pearl_lkwin_scan(unsigned long node, const char *uname,
 		pearl_lk_wins[pearl_lk_win_cnt].base = base;
 		pearl_lk_wins[pearl_lk_win_cnt].size = size;
 		pearl_lk_win_cnt++;
+		if (wifi_pool && single_range) {
+			pearl_lk_wifi_pool.base = base;
+			pearl_lk_wifi_pool.size = size;
+		}
 	}
 	return 0;
 }
@@ -1194,6 +1210,101 @@ static void __init pearl_reserve_lk_reserved_mem(void)
 			i, &b, &e, &sz);
 	}
 }
+
+static int __init pearl_sync_lk_wifi_pool(void)
+{
+	struct device_node *wifi_node, *pool_node;
+	struct reserved_mem *rmem;
+	struct property *reg_property;
+	__be32 *reg;
+	phys_addr_t old_base;
+	int address_cells, size_cells, cell_index, ret = -EINVAL;
+
+	if (!of_machine_is_compatible("xiaomi,pearl"))
+		return 0;
+	if (pearl_lk_wifi_pool_count != 1 || !pearl_lk_wifi_pool.size ||
+	    !IS_ALIGNED(pearl_lk_wifi_pool.base, PAGE_SIZE) ||
+	    !IS_ALIGNED(pearl_lk_wifi_pool.size, PAGE_SIZE)) {
+		pr_err("PEARL-WIFI-RMEM: missing or invalid LK pool (count=%d)\n",
+		       pearl_lk_wifi_pool_count);
+		return -EINVAL;
+	}
+
+	wifi_node = of_find_compatible_node(NULL, NULL, "mediatek,wifi");
+	if (!wifi_node)
+		return -ENODEV;
+	pool_node = of_parse_phandle(wifi_node, "memory-region", 0);
+	of_node_put(wifi_node);
+	if (!pool_node)
+		return -ENODEV;
+
+	rmem = of_reserved_mem_lookup(pool_node);
+	if (!rmem || !rmem->ops || !rmem->ops->device_init ||
+	    !of_device_is_compatible(pool_node, "shared-dma-pool") ||
+	    !of_property_present(pool_node, "no-map") ||
+	    of_property_present(pool_node, "reusable") ||
+	    of_property_present(pool_node, "linux,dma-default")) {
+		pr_err("PEARL-WIFI-RMEM: unsupported pool %pOF\n", pool_node);
+		goto out_put;
+	}
+	if (rmem->priv) {
+		pr_err("PEARL-WIFI-RMEM: pool already in use %pOF\n", pool_node);
+		ret = -EBUSY;
+		goto out_put;
+	}
+
+	address_cells = of_n_addr_cells(pool_node);
+	size_cells = of_n_size_cells(pool_node);
+	if (address_cells < 1 || address_cells > 2 ||
+	    size_cells < 1 || size_cells > 2 ||
+	    (address_cells == 1 && pearl_lk_wifi_pool.base > U32_MAX) ||
+	    (size_cells == 1 && pearl_lk_wifi_pool.size > U32_MAX)) {
+		pr_err("PEARL-WIFI-RMEM: invalid address/size cells %d/%d\n",
+		       address_cells, size_cells);
+		goto out_put;
+	}
+
+	reg_property = kzalloc(sizeof(*reg_property), GFP_KERNEL);
+	if (!reg_property) {
+		ret = -ENOMEM;
+		goto out_put;
+	}
+	reg_property->name = kstrdup("reg", GFP_KERNEL);
+	reg_property->length = (address_cells + size_cells) * sizeof(*reg);
+	reg_property->value = kmalloc(reg_property->length, GFP_KERNEL);
+	if (!reg_property->name || !reg_property->value) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	reg = reg_property->value;
+	for (cell_index = 0; cell_index < address_cells; cell_index++)
+		reg[cell_index] = cpu_to_be32(pearl_lk_wifi_pool.base >>
+			(32 * (address_cells - cell_index - 1)));
+	for (cell_index = 0; cell_index < size_cells; cell_index++)
+		reg[address_cells + cell_index] =
+			cpu_to_be32(pearl_lk_wifi_pool.size >>
+				(32 * (size_cells - cell_index - 1)));
+	OF_MARK_DYNAMIC(reg_property);
+
+	old_base = rmem->base;
+	ret = of_update_property(pool_node, reg_property);
+	if (ret)
+		goto out_free;
+	rmem->base = pearl_lk_wifi_pool.base;
+	rmem->size = pearl_lk_wifi_pool.size;
+	pr_info("PEARL-WIFI-RMEM: pool %pOF moved %pa -> %pa, size %pa\n",
+		pool_node, &old_base, &rmem->base, &rmem->size);
+	goto out_put;
+
+out_free:
+	kfree(reg_property->name);
+	kfree(reg_property->value);
+	kfree(reg_property);
+out_put:
+	of_node_put(pool_node);
+	return ret;
+}
+arch_initcall(pearl_sync_lk_wifi_pool);
 
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
