@@ -17,6 +17,7 @@
 #include <linux/fs.h>
 #include <linux/vmalloc.h>
 #include <linux/err.h>
+#include <linux/mutex.h>
 
 #include "ccci_config.h"
 #include "ccci_common_config.h"
@@ -2688,6 +2689,11 @@ static struct notifier_block apsync_notifier = {
 #endif	/* CCCI_SCP_DRIVER_BUILTIN */
 #endif
 #endif
+#ifdef CCCI_KMODULE_ENABLE
+static DEFINE_MUTEX(ccci_scp_init_lock);
+static bool ccci_scp_initialized;
+#endif
+
 int fsm_scp_init(struct ccci_fsm_scp *scp_ctl)
 {
 #ifndef CCCI_KMODULE_ENABLE
@@ -2695,6 +2701,23 @@ int fsm_scp_init(struct ccci_fsm_scp *scp_ctl)
 		container_of(scp_ctl, struct ccci_fsm_ctl, scp_ctl);
 #endif
 	int ret = 0;
+
+#ifdef CCCI_KMODULE_ENABLE
+	mutex_lock(&ccci_scp_init_lock);
+	if (ccci_scp_initialized)
+		goto out_unlock;
+#else
+	scp_ctl->md_id = ctl->md_id;
+#endif
+
+#ifdef FEATURE_SCP_CCCI_SUPPORT
+	INIT_WORK(&scp_ctl->scp_md_state_sync_work,
+		ccci_scp_md_state_sync_work);
+	register_ccci_sys_call_back(scp_ctl->md_id, CCISM_SHM_INIT_ACK,
+		fsm_ccism_init_ack_handler);
+#endif
+	register_ccci_sys_call_back(scp_ctl->md_id, MD_SIM_TYPE,
+		fsm_sim_type_handler);
 
 #ifdef FEATURE_SCP_CCCI_SUPPORT
 #ifdef CCCI_SCP_DRIVER_BUILTIN
@@ -2709,18 +2732,6 @@ int fsm_scp_init(struct ccci_fsm_scp *scp_ctl)
 		"PEARL-27 gate-off: skip scp_A_register_notify (SCP builtin, glue isolated)\n");
 #endif
 #endif
-#ifndef CCCI_KMODULE_ENABLE
-	scp_ctl->md_id = ctl->md_id;
-#endif
-#ifdef FEATURE_SCP_CCCI_SUPPORT
-	INIT_WORK(&scp_ctl->scp_md_state_sync_work,
-		ccci_scp_md_state_sync_work);
-	register_ccci_sys_call_back(scp_ctl->md_id, CCISM_SHM_INIT_ACK,
-		fsm_ccism_init_ack_handler);
-#endif
-
-	register_ccci_sys_call_back(scp_ctl->md_id, MD_SIM_TYPE,
-		fsm_sim_type_handler);
 
 	/* PEARL-30 (r121): autoreg=3 -> registration starts at builtin start
 	 * (~2.2s); scp_ipidev is ready at 1.697s and retries cover the rest.
@@ -2728,17 +2739,15 @@ int fsm_scp_init(struct ccci_fsm_scp *scp_ctl)
 	if (pearl_scp_ipi_autoreg == 3 && scp_ctl->md_id == MD_SYS1)
 		schedule_delayed_work(&pearl_scp_ipi_early_work, 0);
 
+#ifdef CCCI_KMODULE_ENABLE
+	ccci_scp_initialized = true;
+out_unlock:
+	mutex_unlock(&ccci_scp_init_lock);
+#endif
 	return ret;
 }
 
 #ifdef CCCI_KMODULE_ENABLE
-/* PEARL-25: this tree folds the SCP glue into the built-in ccci_md_all
- * instead of using the vendor "mediatek,ccci_md_scp" platform device (this
- * machine's DTS has no such node, and scp.ko hangs the moment it is
- * insmod'ed). So ccci_fsm_init() calls this entry directly to install
- * fsm_scp_init()'s two register_ccci_sys_call_back() hooks -- exactly what
- * the modem's HS2 stage is missing (CCISM_SHM_INIT_ACK / MD_SIM_TYPE).
- */
 void ccci_fsm_scp_builtin_start(void)
 {
 	int ret;
