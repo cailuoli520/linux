@@ -1,0 +1,99 @@
+name: Pearl KASAN kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 7.2-mt6895-xiaomi-pearl
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pearl-kasan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Install LLVM 18 and kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential clang-18 dwarves flex libelf-dev libssl-dev \
+            lld-18 llvm-18 llvm-18-tools pkg-config python3 rsync zstd
+
+      - name: Build the diagnostic kernel
+        env:
+          LLVM_BIN: /usr/lib/llvm-18/bin
+          BASE_CONFIG: ${{ github.workspace }}/arch/arm64/configs/pearl-artifact.config
+          OUTPUT_DIR: ${{ runner.temp }}/pearl-kasan
+          JOBS: "2"
+          LLD_THREADS: "2"
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          free -h
+          bash scripts/pearl/build-kasan.sh 2>&1 | tee "$RUNNER_TEMP/pearl-kasan-ci.log"
+
+      - name: Verify and archive the new kernel and symbols
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pearl-kasan
+        run: |
+          [[ $(cat "$OUTPUT_DIR/build-status.txt") == built ]]
+          [[ $(cat "$OUTPUT_DIR/source-commit.txt") == "$GITHUB_SHA" ]]
+          python3 - "$OUTPUT_DIR/Image" <<'PY'
+          from pathlib import Path
+          import sys
+          with Path(sys.argv[1]).open('rb') as stream:
+              header = stream.read(64)
+          if len(header) != 64 or header[56:60] != b'ARM\x64':
+              raise SystemExit('Not an ARM64 Linux Image; refusing to upload')
+          PY
+          git show --format= --binary "$GITHUB_SHA" > "$OUTPUT_DIR/source-commit.patch"
+          printf 'repository=%s\nsha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > "$OUTPUT_DIR/build-provenance.txt"
+          cd "$OUTPUT_DIR"
+          artifacts=(
+            Image Image.gz mt6895-xiaomi-pearl.dtb vmlinux System.map vmlinux.symvers
+            kernel.config kernel.base.config kernel.patch config-diff.txt kernel-release.txt
+            source-commit.txt source-commit.patch compiler-version.txt build-status.txt
+            klist-next-disassembly.txt vmlinux-notes.txt build-provenance.txt
+          )
+          sha256sum "${artifacts[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          tar --dereference --zstd -cf "$RUNNER_TEMP/pearl-kasan-$GITHUB_SHA.tar.zst" \
+            "${artifacts[@]}" SHA256SUMS
+
+      - name: Upload the kernel and symbols
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          path: ${{ runner.temp }}/pearl-kasan-${{ github.sha }}.tar.zst
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pearl-kasan-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pearl-kasan-ci.log
+            ${{ runner.temp }}/pearl-kasan/*.log
+            ${{ runner.temp }}/pearl-kasan/kernel.base.config
+            ${{ runner.temp }}/pearl-kasan/kernel.config
+            ${{ runner.temp }}/pearl-kasan/config-diff.txt
+          if-no-files-found: warn
+          retention-days: 7

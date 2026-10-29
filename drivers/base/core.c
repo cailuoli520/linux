@@ -1820,12 +1820,30 @@ static void fw_devlink_relax_link(struct device_link *link)
 		dev_name(link->supplier));
 }
 
+static void fw_devlink_check_class_node(struct device_link *link,
+					const char *stage)
+{
+#ifdef CONFIG_DEBUG_LIST
+	struct device *dev = &link->link_dev;
+	struct list_head *node = &dev->p->knode_class.n_node;
+	struct list_head *next = READ_ONCE(node->next);
+	struct list_head *prev = READ_ONCE(node->prev);
+
+	WARN(!next || !prev,
+	     "PEARL-DEVLINK-CORRUPTION: stage=%s link=%s private=%px node=%px next=%px prev=%px supplier=%px consumer=%px flags=%#x\n",
+	     stage, dev_name(dev), dev->p, node, next, prev,
+	     link->supplier, link->consumer, link->flags);
+#endif
+}
+
 static int fw_devlink_no_driver(struct device *dev, void *data)
 {
 	struct device_link *link = to_devlink(dev);
 
+	fw_devlink_check_class_node(link, "before-relax");
 	if (!dev_can_match(link->supplier))
 		fw_devlink_relax_link(link);
+	fw_devlink_check_class_node(link, "after-relax");
 
 	return 0;
 }

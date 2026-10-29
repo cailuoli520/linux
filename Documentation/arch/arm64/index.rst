@@ -24,6 +24,7 @@ ARM64 Architecture
     memory-tagging-extension
     mops
     mpam
+    pearl-boot-debugging
     perf
     pointer-authentication
     ptdump
